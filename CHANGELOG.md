@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Validate existing CSV output and submission batches before appending data.
+
 ## [1.0.0] - 2026-09-14
 
 ### Added
