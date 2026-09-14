@@ -69,7 +69,7 @@ Run the automated tests and local checks before submitting a pull request:
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q reddit_scanner.py scrape_output.py
+python -m compileall -q reddit_scanner.py scrape_run.py scrape_output.py
 python reddit_scanner.py --help
 ```
 

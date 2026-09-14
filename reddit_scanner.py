@@ -24,32 +24,26 @@ import datetime as dt
 import os
 import sys
 import time
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypeVar
 
 import praw
-import prawcore
 
 from scrape_output import ScrapeOutput, ScrapeOutputError
+from scrape_run import (
+    ProgressReported,
+    RetryScheduled,
+    RunStarted,
+    ScrapeEvent,
+    ScrapeRange,
+    ScrapeValidationError,
+    SubmissionFailed,
+    run_scrape,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_FILE = SCRIPT_DIR / ".env"
 SCRAPES_DIR = SCRIPT_DIR / "scrapes"
 DEFAULT_USER_AGENT = "reddit-csv-scraper/1.0"
-
-ReturnType = TypeVar("ReturnType")
-
-# Reddit free-tier Data API limit: 100 queries/min per OAuth client id,
-# averaged over a rolling 10-minute window. prawcore already respects this
-# proactively: it reads the x-ratelimit-remaining/used/reset headers on every
-# response and sleeps *before* the next request, pausing fully when the quota
-# is exhausted. The retry logic below is a safety net for the cases prawcore
-# does not retry itself (429s, and 5xx/network errors past its 3 attempts).
-MAX_RETRIES = 8
-BASE_WAIT = 5  # seconds; doubles on every retry
-MAX_WAIT = 300  # cap for a single backoff sleep
-
 
 def fmt_ts(timestamp: float) -> str:
     """Format a Unix timestamp as a UTC date and time."""
@@ -73,36 +67,6 @@ def prompt_date(label: str, hint: str) -> str | None:
             return raw
         except ValueError:
             print(f"  '{raw}' is not a valid YYYY-MM-DD date, try again.")
-
-
-def call_with_retries(
-    func: Callable[..., ReturnType], *args: Any, **kwargs: Any
-) -> ReturnType:
-    """Call a Reddit API operation with bounded exponential backoff."""
-    last_error: Exception | None = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            return func(*args, **kwargs)
-        except prawcore.exceptions.TooManyRequests as exc:
-            last_error = exc
-            # Reddit tells us how long to wait via the Retry-After header,
-            # which prawcore exposes as exc.retry_after (may be absent).
-            if exc.retry_after is not None:
-                wait = float(exc.retry_after) + 2
-            else:
-                wait = min(BASE_WAIT * 2**attempt, MAX_WAIT)
-            print(f"  Rate limited (429), sleeping {wait:.0f}s...")
-            time.sleep(wait)
-        except (
-            prawcore.exceptions.ServerError,
-            prawcore.exceptions.RequestException,
-        ) as exc:
-            last_error = exc
-            wait = min(BASE_WAIT * 2**attempt, MAX_WAIT)
-            print(f"  {type(exc).__name__}: {exc} — retrying in {wait:.0f}s...")
-            time.sleep(wait)
-
-    raise RuntimeError(f"giving up after {MAX_RETRIES} attempts") from last_error
 
 
 def load_dotenv(path: Path) -> None:
@@ -146,117 +110,40 @@ def make_reddit() -> praw.Reddit:
     )
 
 
-def collect_rows(submission: praw.models.Submission) -> list[dict[str, Any]]:
-    sub_info = {
-        "submission_id": submission.id,
-        "submission_author": submission.author.name if submission.author else "[deleted]",
-        "submission_title": submission.title,
-        "submission_created": fmt_ts(submission.created_utc),
-        "submission_flair": submission.link_flair_text,
-        "submission_over_18": submission.over_18,
-        "submission_num_comments": submission.num_comments,
-        "submission_url": submission.url,
-    }
-
-    call_with_retries(submission.comments.replace_more, limit=None)
-    comments = submission.comments.list()
-
-    if not comments:
-        # Keep zero-comment submissions too, with empty comment fields.
-        return [
-            dict(
-                sub_info,
-                comment_id="",
-                comment_author="",
-                comment_body="",
-                comment_created="",
-                comment_score="",
-            )
-        ]
-
-    return [
-        dict(
-            sub_info,
-            comment_id=c.id,
-            comment_author=c.author.name if c.author else "[deleted]",
-            comment_body=c.body,
-            comment_created=fmt_ts(c.created_utc),
-            comment_score=c.score,
-        )
-        for c in comments
-    ]
-
-
-def scrape(
-    reddit: praw.Reddit,
-    subreddit_name: str,
-    start_ts: float | None,
-    end_ts: float | None,
-    output: ScrapeOutput,
+def terminal_reporter(
+    event: ScrapeEvent,
+    output_path: Path,
+    subreddit: str,
+    start: str | None,
+    end: str,
 ) -> None:
-    subreddit = reddit.subreddit(subreddit_name)
-    stream = subreddit.new(limit=None)
-
-    resuming = output.completed_count > 0
-    processed = skipped = failed = rows_written = 0
-    oldest_seen = None
-    reached_start = False
-
-    try:
-        while True:
-            try:
-                submission = call_with_retries(next, stream)
-            except StopIteration:
-                break
-
-            created = submission.created_utc
-            oldest_seen = created
-
-            if end_ts is not None and created >= end_ts:
-                continue
-            if start_ts is not None and created < start_ts:
-                reached_start = True
-                break
-            if output.has_submission(submission.id):
-                skipped += 1
-                continue
-
-            try:
-                rows = collect_rows(submission)
-            except (RuntimeError, prawcore.PrawcoreException) as exc:
-                failed += 1
-                print(f"  Skipping submission {submission.id} ({exc})")
-                continue
-
-            output.save_submission(rows)
-            rows_written += len(rows)
-            processed += 1
-
-            if processed % 25 == 0:
-                remaining = reddit.auth.limits.get("remaining")
-                quota = f", API quota left: {remaining:.0f}" if remaining is not None else ""
-                print(
-                    f"  {processed} submissions, {rows_written} rows "
-                    f"— now at {fmt_ts(created)[:10]}{quota}"
-                )
-    except KeyboardInterrupt:
-        print("\nInterrupted — all progress is saved. Re-run the same command to resume.")
-
-    print(f"\nDone: {processed} submissions, {rows_written} rows written to {output}")
-    if resuming and skipped:
-        print(f"Skipped {skipped} submissions already present in the file (resume).")
-    if failed:
-        print(f"Failed to fetch {failed} submissions after repeated retries.")
-    if (
-        start_ts is not None
-        and not reached_start
-        and oldest_seen is not None
-        and oldest_seen > start_ts
-    ):
+    """Render Scrape run events with the CLI's established wording."""
+    if isinstance(event, RetryScheduled):
+        if event.rate_limited:
+            print(f"  Rate limited (429), sleeping {event.wait_seconds:.0f}s...")
+        else:
+            print(
+                f"  {event.error_type}: {event.error} "
+                f"— retrying in {event.wait_seconds:.0f}s..."
+            )
+    elif isinstance(event, RunStarted):
+        if event.prior_completion:
+            print(
+                f"Resuming: {output_path} already has "
+                f"{event.prior_completion} submissions; they will be skipped."
+            )
         print(
-            f"Warning: Reddit's API only exposes the ~1000 newest posts; "
-            f"the oldest reachable post is from {fmt_ts(oldest_seen)[:10]}, "
-            f"so the range before that date could not be covered."
+            f"Scraping r/{subreddit} from {start or 'the beginning'} to {end} "
+            f"(read-only API, no login) -> {output_path}"
+        )
+    elif isinstance(event, SubmissionFailed):
+        print(f"  Skipping submission {event.submission_id} ({event.error})")
+    elif isinstance(event, ProgressReported):
+        remaining = event.api_quota_remaining
+        quota = f", API quota left: {remaining:.0f}" if remaining is not None else ""
+        print(
+            f"  {event.processed} submissions, {event.rows} rows "
+            f"— now at {fmt_ts(event.submission_created)[:10]}{quota}"
         )
 
 
@@ -321,28 +208,49 @@ def main() -> int:
     )
 
     reddit = make_reddit()
-    try:
-        call_with_retries(lambda: reddit.subreddit(subreddit).created_utc)
-    except (RuntimeError, prawcore.PrawcoreException) as exc:
-        sys.exit(f"Could not reach Reddit / invalid credentials: {exc}")
+    started: float | None = None
 
-    try:
-        with ScrapeOutput(output_path) as output:
-            if output.completed_count:
-                print(
-                    f"Resuming: {output_path} already has "
-                    f"{output.completed_count} submissions; they will be skipped."
-                )
-
-            print(
-                f"Scraping r/{subreddit} from {start or 'the beginning'} to {end} "
-                f"(read-only API, no login) -> {output_path}"
-            )
+    def report_and_track_start(event: ScrapeEvent) -> None:
+        """Render an event and start elapsed timing when traversal begins."""
+        nonlocal started
+        if isinstance(event, RunStarted):
             started = time.monotonic()
-            scrape(reddit, subreddit, start_ts, end_ts, output)
-            print(f"Elapsed: {time.monotonic() - started:.0f}s")
+        terminal_reporter(event, output_path, subreddit, start, end)
+
+    try:
+        outcome = run_scrape(
+            reddit,
+            subreddit,
+            ScrapeRange(start=start_ts, end=end_ts),
+            ScrapeOutput(output_path),
+            report_and_track_start,
+        )
+    except ScrapeValidationError as exc:
+        sys.exit(f"Could not reach Reddit / invalid credentials: {exc}")
     except ScrapeOutputError as exc:
         sys.exit(str(exc))
+
+    if outcome.interrupted:
+        print("\nInterrupted — all progress is saved. Re-run the same command to resume.")
+    print(
+        f"\nDone: {outcome.processed} submissions, {outcome.rows} rows "
+        f"written to {output_path}"
+    )
+    if outcome.prior_completion and outcome.skipped:
+        print(
+            f"Skipped {outcome.skipped} submissions already present in the file "
+            "(resume)."
+        )
+    if outcome.failed:
+        print(f"Failed to fetch {outcome.failed} submissions after repeated retries.")
+    if outcome.incomplete_range and outcome.oldest_seen is not None:
+        print(
+            "Warning: Reddit's API only exposes the ~1000 newest posts; "
+            f"the oldest reachable post is from {fmt_ts(outcome.oldest_seen)[:10]}, "
+            "so the range before that date could not be covered."
+        )
+    if started is not None:
+        print(f"Elapsed: {time.monotonic() - started:.0f}s")
     return 0
 
 
