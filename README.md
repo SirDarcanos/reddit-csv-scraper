@@ -183,6 +183,10 @@ same output path to continue; submission IDs already present in the CSV are
 skipped. Pressing <kbd>Ctrl</kbd>+<kbd>C</kbd> stops the process without losing
 completed submissions.
 
+Before appending, the scraper verifies that an existing file has the current
+CSV header and valid rows. It stops without appending when the file is
+incompatible; choose another output path or migrate the file before resuming.
+
 > [!NOTE]
 > Resuming detects completed submission IDs, not individual comments. Existing
 > submissions are not refreshed if comments were added after the first scrape.

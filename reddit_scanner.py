@@ -20,7 +20,6 @@ subreddit, so very old start dates may not be fully reachable.
 """
 
 import argparse
-import csv
 import datetime as dt
 import os
 import sys
@@ -32,28 +31,14 @@ from typing import Any, TypeVar
 import praw
 import prawcore
 
+from scrape_output import ScrapeOutput, ScrapeOutputError
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_FILE = SCRIPT_DIR / ".env"
 SCRAPES_DIR = SCRIPT_DIR / "scrapes"
 DEFAULT_USER_AGENT = "reddit-csv-scraper/1.0"
 
 ReturnType = TypeVar("ReturnType")
-
-FIELDNAMES = [
-    "submission_id",
-    "submission_author",
-    "submission_title",
-    "submission_created",
-    "submission_flair",
-    "submission_over_18",
-    "submission_num_comments",
-    "submission_url",
-    "comment_id",
-    "comment_author",
-    "comment_body",
-    "comment_created",
-    "comment_score",
-]
 
 # Reddit free-tier Data API limit: 100 queries/min per OAuth client id,
 # averaged over a rolling 10-minute window. prawcore already respects this
@@ -161,15 +146,6 @@ def make_reddit() -> praw.Reddit:
     )
 
 
-def load_done_ids(path: Path) -> set[str]:
-    done = set()
-    if path.exists():
-        with path.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                done.add(row["submission_id"])
-    return done
-
-
 def collect_rows(submission: praw.models.Submission) -> list[dict[str, Any]]:
     sub_info = {
         "submission_id": submission.id,
@@ -216,63 +192,55 @@ def scrape(
     subreddit_name: str,
     start_ts: float | None,
     end_ts: float | None,
-    output: Path,
-    done_ids: set[str],
+    output: ScrapeOutput,
 ) -> None:
     subreddit = reddit.subreddit(subreddit_name)
     stream = subreddit.new(limit=None)
 
-    resuming = bool(done_ids)
-    file_has_data = output.exists() and output.stat().st_size > 0
+    resuming = output.completed_count > 0
     processed = skipped = failed = rows_written = 0
     oldest_seen = None
     reached_start = False
 
-    with output.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        if not file_has_data:
-            writer.writeheader()
+    try:
+        while True:
+            try:
+                submission = call_with_retries(next, stream)
+            except StopIteration:
+                break
 
-        try:
-            while True:
-                try:
-                    submission = call_with_retries(next, stream)
-                except StopIteration:
-                    break
+            created = submission.created_utc
+            oldest_seen = created
 
-                created = submission.created_utc
-                oldest_seen = created
+            if end_ts is not None and created >= end_ts:
+                continue
+            if start_ts is not None and created < start_ts:
+                reached_start = True
+                break
+            if output.has_submission(submission.id):
+                skipped += 1
+                continue
 
-                if end_ts is not None and created >= end_ts:
-                    continue
-                if start_ts is not None and created < start_ts:
-                    reached_start = True
-                    break
-                if submission.id in done_ids:
-                    skipped += 1
-                    continue
+            try:
+                rows = collect_rows(submission)
+            except (RuntimeError, prawcore.PrawcoreException) as exc:
+                failed += 1
+                print(f"  Skipping submission {submission.id} ({exc})")
+                continue
 
-                try:
-                    rows = collect_rows(submission)
-                except (RuntimeError, prawcore.PrawcoreException) as exc:
-                    failed += 1
-                    print(f"  Skipping submission {submission.id} ({exc})")
-                    continue
+            output.save_submission(rows)
+            rows_written += len(rows)
+            processed += 1
 
-                writer.writerows(rows)
-                f.flush()
-                rows_written += len(rows)
-                processed += 1
-
-                if processed % 25 == 0:
-                    remaining = reddit.auth.limits.get("remaining")
-                    quota = f", API quota left: {remaining:.0f}" if remaining is not None else ""
-                    print(
-                        f"  {processed} submissions, {rows_written} rows "
-                        f"— now at {fmt_ts(created)[:10]}{quota}"
-                    )
-        except KeyboardInterrupt:
-            print("\nInterrupted — all progress is saved. Re-run the same command to resume.")
+            if processed % 25 == 0:
+                remaining = reddit.auth.limits.get("remaining")
+                quota = f", API quota left: {remaining:.0f}" if remaining is not None else ""
+                print(
+                    f"  {processed} submissions, {rows_written} rows "
+                    f"— now at {fmt_ts(created)[:10]}{quota}"
+                )
+    except KeyboardInterrupt:
+        print("\nInterrupted — all progress is saved. Re-run the same command to resume.")
 
     print(f"\nDone: {processed} submissions, {rows_written} rows written to {output}")
     if resuming and skipped:
@@ -348,8 +316,9 @@ def main() -> int:
     end_ts = (end_dt + dt.timedelta(days=1)).timestamp()
 
     default_name = f"topics_with_comments_{start or 'all'}_to_{end}.csv"
-    output = Path(args.output).expanduser() if args.output else SCRAPES_DIR / default_name
-    output.parent.mkdir(parents=True, exist_ok=True)
+    output_path = (
+        Path(args.output).expanduser() if args.output else SCRAPES_DIR / default_name
+    )
 
     reddit = make_reddit()
     try:
@@ -357,20 +326,23 @@ def main() -> int:
     except (RuntimeError, prawcore.PrawcoreException) as exc:
         sys.exit(f"Could not reach Reddit / invalid credentials: {exc}")
 
-    done_ids = load_done_ids(output)
-    if done_ids:
-        print(
-            f"Resuming: {output} already has {len(done_ids)} submissions; "
-            "they will be skipped."
-        )
+    try:
+        with ScrapeOutput(output_path) as output:
+            if output.completed_count:
+                print(
+                    f"Resuming: {output_path} already has "
+                    f"{output.completed_count} submissions; they will be skipped."
+                )
 
-    print(
-        f"Scraping r/{subreddit} from {start or 'the beginning'} to {end} "
-        f"(read-only API, no login) -> {output}"
-    )
-    started = time.monotonic()
-    scrape(reddit, subreddit, start_ts, end_ts, output, done_ids)
-    print(f"Elapsed: {time.monotonic() - started:.0f}s")
+            print(
+                f"Scraping r/{subreddit} from {start or 'the beginning'} to {end} "
+                f"(read-only API, no login) -> {output_path}"
+            )
+            started = time.monotonic()
+            scrape(reddit, subreddit, start_ts, end_ts, output)
+            print(f"Elapsed: {time.monotonic() - started:.0f}s")
+    except ScrapeOutputError as exc:
+        sys.exit(str(exc))
     return 0
 
 

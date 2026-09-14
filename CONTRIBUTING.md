@@ -65,10 +65,11 @@ Avoid committing generated files, caches, local environments, or editor metadata
 
 ## Validate the change
 
-This repository does not currently have an automated test suite. Run the available local checks before submitting a pull request:
+Run the automated tests and local checks before submitting a pull request:
 
 ```bash
-python -m compileall -q reddit_scanner.py
+python -m unittest discover -s tests -v
+python -m compileall -q reddit_scanner.py scrape_output.py
 python reddit_scanner.py --help
 ```
 
